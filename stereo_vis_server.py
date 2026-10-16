@@ -3,54 +3,40 @@
 """
 Minimal stereo AprilTag server for the Vision Pi (monochrome cameras).
 
-This is a corrected version of the previous server. Fixes applied:
-
-FRAME / MATH FIXES
 1.  Triangulated points are produced in the RECTIFIED left-camera frame
     (rotated by R1 relative to the physical left camera). They are now
     rotated back into the PHYSICAL left-camera frame with R1^T before any
     position or orientation math. This removes the constant fake yaw and
     the distance-dependent x error that the old constant offsets were
     fighting.
-2.  The stereo-midpoint shift now uses the CALIBRATED baseline (from the
+2.  The stereo-midpoint shift uses the CALIBRATED baseline (from the
     calibration file / P2), not a hardcoded 50.0 mm, and the midpoint
     vector is rotated into the physical camera frame as well.
-3.  Triangulation units are now explicit. Set CALIB_UNITS below to match
+3.  Triangulation units are explicit. Set CALIB_UNITS below to match
     the units of your chessboard square size during stereoCalibrate.
     A startup sanity check prints and validates the baseline.
-4.  Orientation is now a proper, consistent decomposition:
+4.  Orientation is a consistent decomposition:
     R = Ry(yaw) * Rx(pitch) * Rz(roll) in the camera frame
-    (+X right, +Y down, +Z forward). Yaw/pitch keep the exact same
-    convention as before (yaw = atan2(nx, nz), pitch = atan2(-ny, ...)),
-    so the Control Pi sees compatible values, but roll is now extracted
-    after removing yaw and pitch instead of being an unrelated 2D angle.
+    (+X right, +Y down, +Z forward), (yaw = atan2(nx, nz), pitch = atan2(-ny, ...)). 
+    Roll is now extracted after removing yaw and pitch instead of being an unrelated 2D angle.
 5.  Tag plane axes are orthogonalized (noise/perspective made the raw
     edge vectors non-orthogonal).
 
-ROBUSTNESS / LOGIC FIXES
 6.  Guard against w ~ 0 and non-finite values in triangulation (NaN used
     to silently PASS the quality filters and could emit invalid JSON).
-7.  Disparity checks run FIRST, so a swapped-camera problem is reported
-    as such instead of as "z out of range". A minimum disparity threshold
-    was added (tiny disparity = huge depth noise).
-8.  Duplicate tag IDs seen twice in one image are rejected instead of
-    silently overwriting each other (which could triangulate corners from
-    two DIFFERENT physical tags against each other).
+7.  Disparity checks run FIRST, so a swapped-camera problem is reported as such.
+8.  Duplicate tag IDs seen twice in one image are rejected.
 9.  Left/right frame skew is measured from sensor timestamps and pairs
     with too much skew are rejected (two free-running cameras are not
     synchronized; motion during the skew creates false disparity).
-10. distance_mm is computed from the geometric position only. The
-    troubleshooting X_ZERO_OFFSET_MM no longer pollutes it.
+10. distance_mm is computed from the geometric position only.
 11. If the capture thread dies (bad calibration file, camera failure),
-    the server now publishes the error on /tag instead of serving a
-    stale "server starting" forever.
+    the server publishes the error on /tag.
 
-MONOCHROME CAMERAS
-12. Frames are captured as YUV420 and the Y (luma) plane is used
+12. =Frames are captured as YUV420 and the Y (luma) plane is used
     directly as the grayscale image. No RGB conversion, no channel-order
     ambiguity, and it is faster.
 
-ZERO OFFSETS
     X_ZERO_OFFSET_MM and Y_AXIS_ROTATION_ZERO_OFFSET_DEG are kept for
     troubleshooting but default to 0.0. After the frame fixes above they
     should stay at (or very near) 0. Sign convention for BOTH:
@@ -58,22 +44,12 @@ ZERO OFFSETS
         be zero; it is subtracted from the output.
 """
 
-import json
-import time
-import math
-import threading
+import json, time, math, threading, cv2
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-
-import cv2
 import numpy as np
 from picamera2 import Picamera2
 from libcamera import Transform
 from pupil_apriltags import Detector
-
-
-# ============================================================
-# CAMERA SETTINGS
-# ============================================================
 
 WIDTH = 1280
 HEIGHT = 800
@@ -93,33 +69,17 @@ FLIP_CAMERAS_180 = True
 # static you can raise this or set it to None to disable the check.
 MAX_FRAME_SKEW_MS = None
 
-
-# ============================================================
-# CALIBRATION UNITS
-# ============================================================
-
 # Units of the translation vector T from stereoCalibrate, i.e. the units
 # your chessboard square size was given in during calibration.
 #   "m"  -> triangulated points come out in metres
 #   "mm" -> triangulated points come out in millimetres
 CALIB_UNITS = "m"
 
-
-# ============================================================
-# HTTP SERVER SETTINGS
-# ============================================================
-
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5005
 
-
-# ============================================================
-# APRILTAG SETTINGS
-# ============================================================
-
 TAG_FAMILIES = ["tag36h11", "tag25h9"]
 
-# Optional: restrict to one family. Keep None to accept both families.
 TARGET_TAG_FAMILY = None
 
 # Real printed black-square AprilTag size in metres.
@@ -128,24 +88,13 @@ TAG_SIZE_M = 0.1
 # Set to None to accept any tag, or set to a specific tag ID.
 TARGET_TAG_ID = None
 
-
-# ============================================================
-# VISION-SIDE ZERO OFFSETS (troubleshooting only, default 0.0)
-# ============================================================
-
 # Subtracted from the reported x_mm. If a physically centered tag reads
 # x_mm = +7.2, set this to +7.2. Should be ~0 after the frame fixes.
 X_ZERO_OFFSET_MM = 3.0
 
 # Subtracted from the reported tag_yaw_deg. If a physically square tag
-# reads tag_yaw_deg = +3.8, set this to +3.8. Should be ~0 after the
-# frame fixes.
+# reads tag_yaw_deg = +3.8, set this to +3.8. Should be ~0 after the frame fixes.
 Y_AXIS_ROTATION_ZERO_OFFSET_DEG = 0.0
-
-
-# ============================================================
-# QUALITY FILTERS
-# ============================================================
 
 MIN_DECISION_MARGIN = 20.0
 
@@ -160,11 +109,6 @@ MIN_DISPARITY_PX = 5.0
 
 # If true, opens a local OpenCV preview window.
 SHOW_PREVIEW = True
-
-
-# ============================================================
-# SHARED DATA
-# ============================================================
 
 latest_lock = threading.Lock()
 
@@ -183,10 +127,19 @@ def publish(data):
     with latest_lock:
         latest_data = data
 
+latest_jpeg = None
+jpeg_cond = threading.Condition()
+stream_clients = 0
+clients_lock = threading.Lock()
 
-# ============================================================
-# BASIC HELPERS
-# ============================================================
+
+def publish_jpeg(img_bgr):
+    global latest_jpeg
+    ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if ok:
+        with jpeg_cond:
+            latest_jpeg = buf.tobytes()
+            jpeg_cond.notify_all()
 
 def minimal_error(reason, timestamp=None):
     if timestamp is None:
@@ -233,11 +186,6 @@ def minimal_success(tag, timestamp, frame_skew_ms):
         "age_s": 0.0,
     }
 
-
-# ============================================================
-# CALIBRATION
-# ============================================================
-
 def load_calibration(path):
     data = np.load(path)
 
@@ -260,7 +208,6 @@ def load_calibration(path):
     else:
         raise RuntimeError(f"CALIB_UNITS must be 'm' or 'mm', got {CALIB_UNITS!r}")
 
-    # FIX #2/#3: derive the baseline from P2 itself.
     # For a rectified horizontal pair, P2[0,3] = -fx * B (in calib units).
     P2 = calib["P2"]
     baseline_units = -float(P2[0, 3]) / float(P2[0, 0])
@@ -296,8 +243,6 @@ def sanity_check_calibration(calib):
     if calib["stereo_rms"] is not None:
         print(f"  stereo RMS:            {calib['stereo_rms']:.4f} px")
 
-    # FIX #1 diagnostics: show how far the rectified frame is rotated from
-    # the physical left camera. This rotation used to leak into x/yaw.
     rvec, _ = cv2.Rodrigues(calib["R1"])
     r1_deg = math.degrees(float(np.linalg.norm(rvec)))
     print(f"  R1 rectification tilt: {r1_deg:.3f} deg "
@@ -316,18 +261,12 @@ def sanity_check_calibration(calib):
         print(f"  camera:      {(WIDTH, HEIGHT)}")
         print()
 
-
-# ============================================================
-# CAMERA FUNCTIONS (monochrome)
-# ============================================================
-
 def setup_camera(index):
     cam = Picamera2(index)
 
     transform = Transform(hflip=1, vflip=1) if FLIP_CAMERAS_180 else Transform()
 
-    # FIX #12: monochrome sensor. Capture YUV420 and use the Y plane as the
-    # grayscale image directly. No RGB conversion, no channel-order issues.
+    # Capture YUV420 and use the Y plane as the grayscale image directly.
     config = cam.create_video_configuration(
         main={
             "format": "YUV420",
@@ -348,7 +287,7 @@ def capture_gray_with_timestamp(cam):
     Capture one frame; return (gray_uint8, sensor_timestamp_ns or None).
 
     Uses the request API so we get the hardware SensorTimestamp, which is
-    needed for the left/right skew check (FIX #9).
+    needed for the left/right skew check.
     """
     request = cam.capture_request()
     try:
@@ -359,11 +298,6 @@ def capture_gray_with_timestamp(cam):
     finally:
         request.release()
     return gray, ts_ns
-
-
-# ============================================================
-# DETECTORS
-# ============================================================
 
 def create_detector_for_family(family):
     return Detector(
@@ -398,7 +332,7 @@ def detections_by_family_and_id(gray_image, detectors):
     """
     Run each single-family detector; return detections keyed by (family, id).
 
-    FIX #8: if the SAME (family, id) appears more than once in one image,
+    if the SAME (family, id) appears more than once in one image,
     all copies are discarded. Previously the last one silently overwrote
     the first, which could triangulate two different physical tags
     against each other.
@@ -423,11 +357,6 @@ def detections_by_family_and_id(gray_image, detectors):
         del output[key]
 
     return output
-
-
-# ============================================================
-# STEREO GEOMETRY
-# ============================================================
 
 def rectify_points(points, K, D, R_rect, P_rect):
     """Distorted original-image points -> rectified pixel points."""
@@ -457,7 +386,7 @@ def triangulate_tag(left_det, right_det, calib):
         calib["P1"], calib["P2"], left_rect.T, right_rect.T,
     )
 
-    # FIX #6: guard w ~ 0 and non-finite values. NaN used to pass filters.
+    # guard w ~ 0 and non-finite values. NaN used to pass filters.
     w = points_4d[3]
     if np.any(np.abs(w) < 1e-12):
         return None, left_rect, right_rect
@@ -467,11 +396,10 @@ def triangulate_tag(left_det, right_det, calib):
     if not np.all(np.isfinite(corners_rect)):
         return None, left_rect, right_rect
 
-    # FIX #1: rotate rectified-frame points back into the PHYSICAL left
+    # Rotate rectified-frame points back into the PHYSICAL left
     # camera frame. Rectified coords: p_rect = R1 @ p_cam  ->  p_cam = R1^T p_rect.
     corners_cam = corners_rect @ calib["R1"]      # == (R1.T @ p) per point
 
-    # FIX #3: explicit unit conversion.
     corners_cam_mm = corners_cam * calib["units_to_mm"]
 
     return corners_cam_mm, left_rect, right_rect
@@ -510,7 +438,7 @@ def estimate_tag_orientation(corners_mm):
       R = Ry(yaw) * Rx(pitch) * Rz(roll)
       normal straight at camera  -> yaw = 0, pitch = 0
 
-    FIX #4/#5: axes are orthogonalized and roll is extracted by removing
+    Axes are orthogonalized and roll is extracted by removing
     yaw and pitch first, so (yaw, pitch, roll) is now one consistent
     rotation decomposition instead of three unrelated numbers.
     """
@@ -533,11 +461,9 @@ def estimate_tag_orientation(corners_mm):
         return None
     normal = normal / nn
 
-    # Make the normal point away from the camera (+Z).
     if normal[2] < 0:
         normal = -normal
 
-    # Orthogonalize x_axis against the normal (FIX #5).
     x_axis = x_axis - np.dot(x_axis, normal) * normal
     nx2 = np.linalg.norm(x_axis)
     if nx2 < 1e-9:
@@ -546,12 +472,10 @@ def estimate_tag_orientation(corners_mm):
 
     n_x, n_y, n_z = normal
 
-    # Same yaw/pitch convention as before:
-    #   normal = (sin(yaw)cos(pitch), -sin(pitch), cos(yaw)cos(pitch))
+    #  normal = (sin(yaw)cos(pitch), -sin(pitch), cos(yaw)cos(pitch))
     yaw = math.atan2(n_x, n_z)
     pitch = math.atan2(-n_y, math.sqrt(n_x * n_x + n_z * n_z))
 
-    # Remove yaw then pitch from x_axis; what remains is pure roll (FIX #4).
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
 
@@ -577,15 +501,10 @@ def estimate_tag_orientation(corners_mm):
         "tag_roll_deg": float(math.degrees(roll)),
     }
 
-
-# ============================================================
-# FRAME PROCESSING
-# ============================================================
-
 def process_frame_pair(left_gray, right_gray, detectors, calib, frame_skew_ms):
     timestamp = time.time()
 
-    # FIX #9: reject unsynchronized pairs (motion -> false disparity).
+    # Reject unsynchronized pairs (motion -> false disparity).
     if (MAX_FRAME_SKEW_MS is not None
             and frame_skew_ms is not None
             and frame_skew_ms > MAX_FRAME_SKEW_MS):
@@ -618,8 +537,7 @@ def process_frame_pair(left_gray, right_gray, detectors, calib, frame_skew_ms):
             left_det, right_det, calib
         )
 
-        # FIX #7: disparity checks FIRST, so a swapped-camera or
-        # too-far-away problem is reported clearly.
+        # Disparity checks FIRST, so a swapped-camera or too-far-away problem is reported clearly.
         disparities_px = left_rect[:, 0] - right_rect[:, 0]
         mean_disparity_px = float(np.mean(disparities_px))
         min_disparity_px = float(np.min(disparities_px))
@@ -646,7 +564,7 @@ def process_frame_pair(left_gray, right_gray, detectors, calib, frame_skew_ms):
 
         # Geometric center: origin at stereo midpoint, physical camera axes.
         center_cam_mm = np.mean(corners_cam_mm, axis=0)
-        center_mid_mm = center_cam_mm - mid_offset_mm   # FIX #1/#2
+        center_mid_mm = center_cam_mm - mid_offset_mm
 
         x_mm = float(center_mid_mm[0])
         y_mm = float(center_mid_mm[1])
@@ -666,8 +584,7 @@ def process_frame_pair(left_gray, right_gray, detectors, calib, frame_skew_ms):
             reject("could not estimate tag orientation")
             continue
 
-        # FIX #10: distance from geometry only, BEFORE the troubleshooting
-        # x offset is applied.
+        # Distance from geometry only, BEFORE the troubleshooting x offset is applied.
         distance_mm = float(math.sqrt(x_mm * x_mm + y_mm * y_mm + z_mm * z_mm))
 
         valid_tags.append({
@@ -693,11 +610,6 @@ def process_frame_pair(left_gray, right_gray, detectors, calib, frame_skew_ms):
     best = min(valid_tags, key=lambda r: r["distance_mm"])
     return minimal_success(best, timestamp, frame_skew_ms)
 
-
-# ============================================================
-# PREVIEW
-# ============================================================
-
 def safe_float_text(value, digits=1):
     if value is None:
         return "None"
@@ -707,7 +619,7 @@ def safe_float_text(value, digits=1):
         return str(value)
 
 
-def draw_preview(left_gray, right_gray, data):
+def build_preview(left_gray, right_gray, data):
     preview = np.hstack((left_gray, right_gray))
     preview = cv2.resize(preview, None, fx=0.5, fy=0.5)
     preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
@@ -727,17 +639,14 @@ def draw_preview(left_gray, right_gray, data):
     cv2.putText(preview, text, (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
+    return preview
+
+def show_preview(preview):
     cv2.imshow("Stereo AprilTag Server: left | right", preview)
     cv2.waitKey(1)
 
-
-# ============================================================
-# CAPTURE THREAD
-# ============================================================
-
 def capture_loop():
-    # FIX #11: any startup failure is published to /tag instead of
-    # leaving the server serving "server starting" forever.
+    # Any startup failure is published to /tag
     try:
         calib = load_calibration(CALIB_FILE)
         sanity_check_calibration(calib)
@@ -785,8 +694,12 @@ def capture_loop():
 
             publish(data)
 
-            if SHOW_PREVIEW and left_gray is not None:
-                draw_preview(left_gray, right_gray, data)
+            if left_gray is not None and (SHOW_PREVIEW or stream_clients > 0):
+                preview = build_preview(left_gray, right_gray, data)
+                if stream_clients > 0:
+                    publish_jpeg(preview)
+                if SHOW_PREVIEW:
+                    show_preview(preview)
 
     finally:
         print("Stopping cameras...")
@@ -795,12 +708,33 @@ def capture_loop():
         if SHOW_PREVIEW:
             cv2.destroyAllWindows()
 
-
-# ============================================================
-# HTTP SERVER
-# ============================================================
-
 class TagRequestHandler(BaseHTTPRequestHandler):
+    def _stream_mjpeg(self):
+        global stream_clients
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        with clients_lock:
+            stream_clients += 1
+        try:
+            last = None
+            while True:
+                with jpeg_cond:
+                    jpeg_cond.wait(timeout=2.0)
+                    jpg = latest_jpeg
+                if jpg is None or jpg is last:
+                    continue
+                last = jpg
+                self.wfile.write(
+                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n"
+                )
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            with clients_lock:
+                stream_clients -= 1
     def _send_json(self, data, status=200):
         body = json.dumps(data, indent=2).encode("utf-8")
         self.send_response(status)
@@ -811,6 +745,10 @@ class TagRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/stream":
+            self._stream_mjpeg()
+            return
+
         if self.path in ["/", "/latest", "/tag", "/data"]:
             with latest_lock:
                 data = dict(latest_data)
@@ -870,11 +808,7 @@ def run_http_server():
     print(f"  http://<vision-pi-ip>:{SERVER_PORT}/config")
     print()
     server.serve_forever()
-
-
-# ============================================================
-# MAIN
-# ============================================================
+    
 
 def main():
     capture_thread = threading.Thread(target=capture_loop, daemon=True)
