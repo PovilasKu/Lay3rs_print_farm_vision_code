@@ -121,6 +121,14 @@ latest_data = {
     "age_s": 0.0,
 }
 
+STREAM_DOWNSCALE = 0.6
+STREAM_QUALITY = 50
+STREAM_FPS = 8
+
+last_view_ts = 0.0
+
+def viewer_active():
+    return stream_clients > 0 or (time.time() - last_view_ts) < 3.0
 
 def publish(data):
     global latest_data
@@ -135,7 +143,7 @@ clients_lock = threading.Lock()
 
 def publish_jpeg(img_bgr):
     global latest_jpeg
-    ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, STREAM_QUALITY])
     if ok:
         with jpeg_cond:
             latest_jpeg = buf.tobytes()
@@ -674,6 +682,8 @@ def capture_loop():
 
     print("Stereo AprilTag capture loop started.")
 
+    last_encode = 0.0
+
     try:
         while True:
             try:
@@ -694,12 +704,15 @@ def capture_loop():
 
             publish(data)
 
-            if left_gray is not None and (SHOW_PREVIEW or stream_clients > 0):
-                preview = build_preview(left_gray, right_gray, data)
-                if stream_clients > 0:
-                    publish_jpeg(preview)
-                if SHOW_PREVIEW:
-                    show_preview(preview)
+            if left_gray is not None:
+                want_stream = viewer_active() and (time.time() - last_encode) >= 1.0 / STREAM_FPS
+                if want_stream or SHOW_PREVIEW:
+                    preview = build_preview(left_gray, right_gray, data)
+                    if want_stream:
+                        last_encode = time.time()
+                        publish_jpeg(cv2.resize(preview, None, fx=STREAM_DOWNSCALE, fy=STREAM_DOWNSCALE, interpolation=cv2.INTER_AREA))
+                    if SHOW_PREVIEW:
+                        show_preview(preview)
 
     finally:
         print("Stopping cameras...")
@@ -743,10 +756,30 @@ class TagRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+    
+    def _send_snapshot(self):
+        global last_view_ts
+        last_view_ts = time.time()
+        with jpeg_cond:
+            jpg = latest_jpeg
+        if jpg is None:
+            self.send_response(204)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(jpg)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(jpg)
 
     def do_GET(self):
         if self.path == "/stream":
             self._stream_mjpeg()
+            return
+
+        if self.path.startswith("/snapshot"):
+            self._send_snapshot()
             return
 
         if self.path in ["/", "/latest", "/tag", "/data"]:
